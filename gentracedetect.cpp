@@ -13,7 +13,7 @@ using std::string;
 //////////////////////////////////////////////////////////////////////////
 
 #define EXECSAMPLECODE_ADDRESS		NULL
-#define EXECSAMPLECODE_SIZEBYTES	(4096 * 10)
+#define EXECSAMPLECODE_SIZEBYTES	(4096 * 128)
 
 
 extern const uint8_t g_sample_code_program_prolog[];
@@ -42,7 +42,7 @@ bool create_sample_memory_region(void **p_out_region_address)
 	
 	do 
 	{
-		p_allocationAddress = VirtualAllocEx(current_process_handle, EXECSAMPLECODE_ADDRESS, region_size, flags, PAGE_EXECUTE_READWRITE);
+		p_allocationAddress = ::VirtualAllocEx(current_process_handle, EXECSAMPLECODE_ADDRESS, region_size, flags, PAGE_EXECUTE_READWRITE);
 		if (p_allocationAddress == NULL)
 		{
 			show_failure_message("Virtual Alloc Failed");
@@ -50,17 +50,19 @@ bool create_sample_memory_region(void **p_out_region_address)
 		}
 
 		DWORD old_protect_flags;
-		if (!VirtualProtectEx(current_process_handle, p_allocationAddress, region_size, PAGE_EXECUTE_READWRITE, &old_protect_flags))
+		if (!::VirtualProtectEx(current_process_handle, p_allocationAddress, region_size, PAGE_EXECUTE_READWRITE, &old_protect_flags))
 		{
 			show_failure_message("Virtual Protect Failed");
 			break;
 		}
 
-		if (!FlushInstructionCache(current_process_handle, p_allocationAddress, region_size))
+		if (!::FlushInstructionCache(current_process_handle, p_allocationAddress, region_size))
 		{
 			show_failure_message("Flushing instructions cache failed");
 			break;
 		}
+
+		*p_out_region_address = p_allocationAddress;
 
 		result = true;
 	} 
@@ -72,10 +74,6 @@ bool create_sample_memory_region(void **p_out_region_address)
 		{
 			VirtualFreeEx(current_process_handle,  p_allocationAddress, region_size, MEM_RELEASE);
 		}
-	}
-	else
-	{
-		*p_out_region_address = p_allocationAddress;
 	}
 
 	return result;
@@ -95,9 +93,7 @@ void generate_sample_code(void *destination, size_t destination_size)
 	{
 		void *next_block_start = (void *) ((uintptr_t) destination + offset);
 		::memcpy(next_block_start, &g_sample_program_code_body[0], body_chunk_size);
-		offset += body_chunk_size;
-
-		//std::cout << "generated nect chunk of body. New offset: " << offset << std::endl;
+		offset += body_chunk_size;		
 	}
 
 	void *last_block_start = (void *) ((uintptr_t) destination + offset);
@@ -119,18 +115,15 @@ void show_failure_message(const string &user_message)
 
 
 string format_results_message(int result_value, unsigned timeTaken)
-{	
-	string result;
-	
-	result += "Result: ";
-	result += std::to_string(result_value);
-	result += "\nTime Taken: ";
-	result += std::to_string(timeTaken);
+{		
+	std::stringstream ss;
+	ss << "Result: " << result_value << std::endl;
+	ss << "Time Taken: " << timeTaken;
 
-	return result;
+	return ss.str();
 }
 
-typedef int (*sample_code_func)(int input);
+typedef int (*sample_code_func_t)(int input);
 
 
 //////////////////////////////////////////////////////////////////////////
@@ -146,22 +139,16 @@ int main()
 	if (create_sample_memory_region(&code_address))
 	{			
 		generate_sample_code(code_address, EXECSAMPLECODE_SIZEBYTES);
-
-		// detect current time
-		QueryPerformanceFrequency(&frequency); 
-		QueryPerformanceCounter(&start_time);
-		
+		sample_code_func_t sample_fn_ptr = (sample_code_func_t) code_address;
 		int sample_result;
-		// measured code
-		{
-			sample_code_func sample_fn_ptr = (sample_code_func) code_address;
+
+		QueryPerformanceFrequency(&frequency); 
+		
+		QueryPerformanceCounter(&start_time);							
 			sample_result = sample_fn_ptr(100);
-
-			QueryPerformanceCounter(&end_time);
-			time_taken.QuadPart = end_time.QuadPart - start_time.QuadPart;
-		}
-
-		// detect current end time and calculate duration
+		QueryPerformanceCounter(&end_time);
+		
+		time_taken.QuadPart = end_time.QuadPart - start_time.QuadPart;		
 		time_taken.QuadPart *= 1000000;
 		time_taken.QuadPart /= frequency.QuadPart;
 
