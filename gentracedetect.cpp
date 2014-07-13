@@ -6,6 +6,7 @@
 #include <string>
 #include <cassert>
 #include <cstdio>
+#include <stdexcept>
 
 using std::string;
 
@@ -13,7 +14,7 @@ using std::string;
 //////////////////////////////////////////////////////////////////////////
 
 #define EXECSAMPLECODE_ADDRESS		NULL
-#define EXECSAMPLECODE_SIZEBYTES	(4096 * 128)
+#define EXECSAMPLECODE_SIZEBYTES	(4096 * 16)         // Try to fit it to the L1
 
 
 extern const uint8_t g_sample_code_program_prolog[];
@@ -28,8 +29,6 @@ extern const size_t g_prolog_size;
 void show_failure_message(const string &user_message);
 string format_results_message(int result_value, unsigned timeTaken);
 
-
-//////////////////////////////////////////////////////////////////////////
 
 bool create_sample_memory_region(void **p_out_region_address)
 {
@@ -128,37 +127,166 @@ typedef int (*sample_code_func_t)(int input);
 
 //////////////////////////////////////////////////////////////////////////
 
+
+//////////////////////////////////////////////////////////////////////////
+
+void finalize_testing_mode();
+
+class current_process
+{
+public:
+    static bool initialize_testing_mode()
+    {
+        bool result = false;
+
+        HANDLE process_handle = ::GetCurrentProcess();
+        HANDLE thread_handle = ::GetCurrentThread();
+
+        do
+        {
+            DWORD_PTR process_afm, system_afm;            
+            if (!::GetProcessAffinityMask(process_handle, &process_afm, &system_afm))
+            {
+                show_failure_message("Getting Processor Afinity Mask Failed");
+                break;
+            }            
+            
+            // Find first available core 
+            DWORD thisproces_afm = 0x01;
+            while ((process_afm & 0x01) == 0)
+            {
+                process_afm >>= 1;
+                thisproces_afm >>= 1;
+            }
+            
+            if (!::SetProcessAffinityMask(process_handle, thisproces_afm))
+            {
+                show_failure_message("Setting Processor Afinity Mask Failed");
+                break;
+            }
+
+            if (!::SetPriorityClass(process_handle, HIGH_PRIORITY_CLASS)) // REALTIME_PRIORITY_CLASS
+            {
+                show_failure_message("Setting Process Priority Class Failed");
+                break;
+            }
+
+            if (!::SetThreadPriority(thread_handle, THREAD_PRIORITY_TIME_CRITICAL)) 
+            {
+                show_failure_message("Setting Thread Priority Class Failed");
+                break;
+            }
+
+            result = true;
+        }
+        while (false);
+
+        if (!result)
+        {
+            finalize_testing_mode();
+        }
+
+        ::SwitchToThread();
+
+        return result;
+    }
+
+    static void finalize_testing_mode()
+    {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);  // Result ignored
+        SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);   // Result ignores
+        // Afinity mask remains unfinalized ...
+    }
+};
+
+
+//////////////////////////////////////////////////////////////////////////
+
+#ifdef USE_RTDSC_FOR_HIGHTIMER
+__declspec(naked) unsigned __int64 get_tc() {
+    __asm  {
+        rdtsc;
+        ret
+    };
+}
+#endif // USE_RTDSC_FOR_HIGHTIMER    
+
+class highres_timer
+{
+public:
+    highres_timer()
+    {
+#ifdef USE_RTDSC_FOR_HIGHTIMER
+#   pragma message ("error: Frequence inspection ss not implemented for rtdsc yet.")
+#else
+        LARGE_INTEGER frequency;
+    
+        if (!QueryPerformanceFrequency(&frequency))
+        {
+            throw std::runtime_error("Failed to get performance counter frequency");
+        }
+
+        m_frequency = frequency.QuadPart;
+#endif // 
+    }
+
+#ifdef USE_RTDSC_FOR_HIGHTIMER    
+    void start() { m_start_time = get_tc(); }
+    void stop() { m_end_time = get_tc(); }
+#else
+    void start() { LARGE_INTEGER start_time; ::QueryPerformanceCounter(&start_time); m_start_time = start_time.QuadPart; }
+    void stop() { LARGE_INTEGER end_time; ::QueryPerformanceCounter(&end_time); m_end_time = end_time.QuadPart; }
+#endif // USE_RTDSC_FOR_HIGHTIMER
+    
+    unsigned long long get_duration()
+    {
+        LARGE_INTEGER time_taken;
+        
+        time_taken.QuadPart = m_end_time - m_start_time;
+        time_taken.QuadPart *= 1000000;
+        time_taken.QuadPart /= m_frequency;
+
+        return time_taken.QuadPart;
+    }
+
+private:    
+    unsigned long long m_start_time, m_end_time, m_frequency;
+};
+
+//////////////////////////////////////////////////////////////////////////
+
 int main()
 {
-	LARGE_INTEGER start_time, end_time, time_taken;
-	LARGE_INTEGER frequency;
+    void *code_address;
 
-	int input = rand()% 1000;
+    if (!create_sample_memory_region(&code_address))
+    {
+        show_failure_message("Failed creating memory region");
+        return EXIT_FAILURE;
+    }
 
-	void *code_address;
-	if (create_sample_memory_region(&code_address))
-	{			
-		generate_sample_code(code_address, EXECSAMPLECODE_SIZEBYTES);
-		sample_code_func_t sample_fn_ptr = (sample_code_func_t) code_address;
-		int sample_result;
+    if (!current_process::initialize_testing_mode())
+    {
+        show_failure_message("Failed to prepare program for testing");
+        return EXIT_FAILURE;
+    }
 
-		QueryPerformanceFrequency(&frequency); 
-		
-		QueryPerformanceCounter(&start_time);							
-			sample_result = sample_fn_ptr(100);
-		QueryPerformanceCounter(&end_time);
-		
-		time_taken.QuadPart = end_time.QuadPart - start_time.QuadPart;		
-		time_taken.QuadPart *= 1000000;
-		time_taken.QuadPart /= frequency.QuadPart;
+    int input = rand() % 1000;
+    generate_sample_code(code_address, EXECSAMPLECODE_SIZEBYTES);
+    sample_code_func_t sample_fn_ptr = (sample_code_func_t) code_address;
+    int sample_result;
 
-		string result_message = format_results_message(sample_result, time_taken.QuadPart);
-		MessageBox(NULL, result_message.c_str(), "Results", 0);
-	}
-	else
-	{
-		MessageBox(NULL, "Failed to allocate executable memory region", "Failure", MB_ICONERROR);
-	}	
+    highres_timer timer;
+    
+    timer.start();
+        sample_result = sample_fn_ptr(100);
+    timer.stop();
+
+    current_process::finalize_testing_mode();
+
+    unsigned long long time_taken = timer.get_duration();
+    string result_message = format_results_message(sample_result, time_taken);    
+    MessageBox(NULL, result_message.c_str(), "Results", 0);
 }
 
 
