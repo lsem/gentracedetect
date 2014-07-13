@@ -165,7 +165,7 @@ public:
                 break;
             }
 
-            if (!::SetPriorityClass(process_handle, HIGH_PRIORITY_CLASS)) // REALTIME_PRIORITY_CLASS
+            if (!::SetPriorityClass(process_handle, REALTIME_PRIORITY_CLASS/*HIGH_PRIORITY_CLASS*/)) // REALTIME_PRIORITY_CLASS
             {
                 show_failure_message("Setting Process Priority Class Failed");
                 break;
@@ -196,6 +196,20 @@ public:
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);  // Result ignored
         SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);   // Result ignores
         // Afinity mask remains unfinalized ...
+    }
+
+    static bool make_function_writable(void *function_address)
+    {   
+        MEMORY_BASIC_INFORMATION mbi = { 0 };
+        if (VirtualQuery(function_address, &mbi, sizeof(mbi)))
+        {            
+            DWORD oldProtect;
+            if (VirtualProtectEx(GetCurrentProcess(), mbi.AllocationBase, mbi.RegionSize, PAGE_EXECUTE_READWRITE, &oldProtect))
+            {
+                return true;
+            }
+        }        
+        return false;
     }
 };
 
@@ -230,7 +244,7 @@ public:
 #endif // 
     }
 
-#ifdef USE_RTDSC_FOR_HIGHTIMER    
+#ifdef USE_RTDSC_FOR_HIGHTIMER
     void start() { m_start_time = get_tc(); }
     void stop() { m_end_time = get_tc(); }
 #else
@@ -255,38 +269,112 @@ private:
 
 //////////////////////////////////////////////////////////////////////////
 
+bool self_mod_timer_bases_detection(int input, int *out_result, unsigned long long *time_taken)
+{   
+    bool result = false;
+    
+    current_process::make_function_writable(&self_mod_timer_bases_detection);
+
+    highres_timer timer;
+    timer.start();
+
+    unsigned char *p = (unsigned char *) &self_mod_timer_bases_detection;
+    while (true)
+    {
+       // find add instruction
+        if ( (*(p+0) == 0x83) && (*(p+1) >= 0xC0 && *(p + 1) <= 0XC2) && (*(p+2) == 0x02) )
+        { // 'add' instruction found 
+            *(p+2) = 100;
+            result = true;
+            break;
+        }
+        else if (*(p+0) == 0x8B && *(p+1) == 0xE5 && *(p+2) == 0x5D && *(p+3) == 0xC3) 
+        { // epilogue found 
+            break;
+        }
+
+        ++p;
+    }
+
+    int a = input;
+    int b = a;
+    b = b + 2;
+    *out_result = b;
+
+    timer.stop();
+    *time_taken = timer.get_duration();
+       
+    return result;
+}
+
+//////////////////////////////////////////////////////////////////////////
+
 int main()
 {
     void *code_address;
 
-    if (!create_sample_memory_region(&code_address))
+    std::stringstream results_stream;
+          
+    do 
     {
-        show_failure_message("Failed creating memory region");
-        return EXIT_FAILURE;
-    }
+        //////////////////////////////////////////////////////////////////////////
+        // SelfMod Test
+        //////////////////////////////////////////////////////////////////////////
 
-    if (!current_process::initialize_testing_mode())
-    {
-        show_failure_message("Failed to prepare program for testing");
-        return EXIT_FAILURE;
-    }
+        results_stream << "SelfMod Test:\n";
+        int self_mod_result;
+        unsigned long long self_mod_time_taken;
+        if (!self_mod_timer_bases_detection(10, &self_mod_result, &self_mod_time_taken))
+        {
+            results_stream << "\tStatus: Failed\n";
+        }
+        else
+        {
+            results_stream << "\tStatus: Executed\n";
+            results_stream << "\tSelfModification Handled: " << (self_mod_result == 110 ? "yes" : "no") << std::endl;
+            results_stream << "\tTime Taken (msec) : " << self_mod_time_taken << std::endl;
+        }
 
-    int input = rand() % 1000;
-    generate_sample_code(code_address, EXECSAMPLECODE_SIZEBYTES);
-    sample_code_func_t sample_fn_ptr = (sample_code_func_t) code_address;
-    int sample_result;
+        //////////////////////////////////////////////////////////////////////////
+        // OnFly Code Generation Test
+        //////////////////////////////////////////////////////////////////////////
 
-    highres_timer timer;
-    
-    timer.start();
+        results_stream << "\n\nOnFly Code Generation Test:\n";
+        if (!create_sample_memory_region(&code_address))
+        {
+            results_stream << "\tStatus: Failed (memory region creation failed)\n";
+            break;
+        }        
+
+        if (!current_process::initialize_testing_mode())
+        {
+            results_stream << "\tStatus: Failed (testing mode initialization feild)\n";           
+            break;
+        }
+
+        int input = rand() % 1000;
+        generate_sample_code(code_address, EXECSAMPLECODE_SIZEBYTES);
+        sample_code_func_t sample_fn_ptr = (sample_code_func_t)code_address;
+        int sample_result;
+
+        highres_timer timer;
+
+        timer.start();
         sample_result = sample_fn_ptr(100);
-    timer.stop();
+        timer.stop();
 
-    current_process::finalize_testing_mode();
+        current_process::finalize_testing_mode();
 
-    unsigned long long time_taken = timer.get_duration();
-    string result_message = format_results_message(sample_result, time_taken);    
-    MessageBox(NULL, result_message.c_str(), "Results", 0);
+        results_stream << "\tStatus: Executed\n";
+
+        unsigned long long time_taken = timer.get_duration();
+        string result_message = format_results_message(sample_result, time_taken);
+
+        results_stream << "\tTime Taken (msec) : " << time_taken << std::endl;
+    } 
+    while (false);
+    
+    MessageBox(NULL, results_stream.str().c_str(), "Results", MB_ICONINFORMATION);
 }
 
 
